@@ -1,0 +1,298 @@
+#
+# INFO2350 Advanced Cloud Infrastructure
+# Chris Szabla - 9001341
+# Professor Nikola Cedic
+# 08/05/2025
+#
+# This template will do the following: 
+# Collect the following Parameters:
+#   EC2 Key Pair
+#   Instance Type (select from 3 types)
+#   AMI - String specifying the AMI to be  used (default to Amazon Linux 2023) 
+# Creates the following resources:
+#   Elastic IP (and associations)
+#   VPC
+#   IGW (including attached gateway)
+#   Public Subnet (includes route table route table association and routes)
+#   Private Subnet (includes route table, route table association and routes) 
+#   Nat EIP and Nat Gateway
+#   Web Security Group
+#   DB Security Group
+#   DB Server instance (including new remote user and DB with test data)
+#   Web Server Instance (including Apache httpd server and script to create a test page that communicates with the DB).
+# Outputs the following data:
+#   Web Server Elastic IP
+#   Web Server Private IP
+#   DB Server Private IP 
+#   
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Automated Web App - VPC with Public Web Server and Private DB (Amazon Linux 2023)"
+
+# When initializing the stack, collect required parameters:
+# Parameters:
+#   Key Pair
+#   Instance type (select from 3 options)
+#   AMI Instance type - String sets default to Amazon Linux 2023 /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair
+    Type: AWS::EC2::KeyPair::KeyName
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t3.micro
+      - t3.small
+    Description: EC2 instance type
+  AMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+# Create required resources 
+Resources:
+
+# Creates a web elastic IP (EIP) in the VPC domain 
+  WebElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+# Creates a new Virtual Private Cloud (VPC) with the network 172.16.0.0/16
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 172.16.0.0/16
+      Tags:
+        - Key: Name
+          Value: csza1341VPC
+
+# Creates an Internet Gateway (IGW) for outbound/inbound traffic to/from the public subnet 
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+# Attaches gateway to the newly created VPC
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref InternetGateway
+
+# Creates a public subnet 172.16.1.0/24 
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 172.16.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+# Creates a private subnet 172.16.2.0/24
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 172.16.2.0/24
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+# Creates a public route table in MyVPC 
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+# Attaching Internet Gateway to the public route table 
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+# Creating association between the public subnet and route table 
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+# Creates a new private route table in myVPC
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+      Tags:
+        - Key: Name
+          Value: PrivateRouteTable
+
+# Creates a new Nat elastic IP to be used with the DB server for outgoing traffic 
+  NatEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+# Creates NatGateway, associates Nat elastic IP with the public subnet 
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: csza1341NatGateway
+
+# Creates route in private route table to the Nat Gateway 
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    DependsOn: NatGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+# Associates private route table with private subnet 
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+# Creates a security group for the public web server 
+# Allows SSH and HTTP traffic to the web server 
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH and HTTP for web server
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+# Creates a security group for the private DB Server
+# Allows access to MySQL from the web server and SSH access 
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL + SSH access from web server
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+# Creates a new DB Server Instance of the AMI type specified using the specified keypair 
+# in the newly created subnet. 
+# Once the instance is created, bash script will update the VM, install MySQL, start the service, 
+# create a new remote user and add a test table and data. 
+  DBServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: !Ref AMI
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref DBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: DBServer
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf update -y
+
+          # Add MySQL 8 repository
+          dnf install -y https://dev.mysql.com/get/mysql80-community-release-el9-1.noarch.rpm
+          dnf config-manager --enable mysql80-community
+          rpm --import https://repo.mysql.com/RPM-GPG-KEY-mysql-2022
+
+          dnf install -y mysql-server --nogpgcheck
+
+          systemctl enable mysqld
+          systemctl start mysqld
+
+          TEMP_PASS=$(grep 'temporary password' /var/log/mysqld.log | awk '{print $NF}')
+          echo "ALTER USER 'root'@'localhost' IDENTIFIED BY 'Secret55!';" > /tmp/mysql-init.sql
+          echo "UNINSTALL COMPONENT 'file://component_validate_password';" >> /tmp/mysql-init.sql
+          echo "CREATE DATABASE csza1341DB;" >> /tmp/mysql-init.sql
+          echo "CREATE USER 'cszabla'@'%' IDENTIFIED BY 'Secret55!';" >> /tmp/mysql-init.sql
+          echo "GRANT ALL PRIVILEGES ON csza1341DB.* TO 'cszabla'@'%';" >> /tmp/mysql-init.sql
+          echo "FLUSH PRIVILEGES;" >> /tmp/mysql-init.sql
+          echo "USE csza1341DB;" >> /tmp/mysql-init.sql
+          echo "CREATE TABLE messages (id INT AUTO_INCREMENT PRIMARY KEY, content VARCHAR(255));" >> /tmp/mysql-init.sql
+          echo "INSERT INTO messages (content) VALUES ('Hello from MySQL!'), ('This is your test app!');" >> /tmp/mysql-init.sql
+          mysql -u root -p"$TEMP_PASS" --connect-expired-password < /tmp/mysql-init.sql
+
+# Creates a new web server instance of the AMI type specified using the specified keypair 
+# in the newly created subnet.
+# Runs bash script to update machine, install httpd, php and php-mysql
+# Creates index.php landing page to connect with database and display test data
+  WebServerInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: DBServerInstance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: !Ref AMI
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      Tags:
+        - Key: Name
+          Value: WebServer
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf update -y
+          dnf install -y httpd php php-mysqli
+          systemctl enable httpd
+          systemctl start httpd
+          echo "<?php" > /var/www/html/index.php
+          echo "\$host = '${DBServerInstance.PrivateIp}';" >> /var/www/html/index.php
+          echo "\$db = 'csza1341DB';" >> /var/www/html/index.php
+          echo "\$user = 'cszabla';" >> /var/www/html/index.php
+          echo "\$pass = 'Secret55!';" >> /var/www/html/index.php
+          echo "\$conn = new mysqli(\$host, \$user, \$pass, \$db);" >> /var/www/html/index.php
+          echo "if (\$conn->connect_error) { die('Connection failed: ' . \$conn->connect_error); }" >> /var/www/html/index.php
+          echo "\$result = \$conn->query('SELECT * FROM messages');" >> /var/www/html/index.php
+          echo "while (\$row = \$result->fetch_assoc()) { echo \$row['content'] . '<br>'; }" >> /var/www/html/index.php
+          echo "\$conn->close();" >> /var/www/html/index.php
+          echo "?>" >> /var/www/html/index.php
+
+# Creates Elastic IP association with the web server instance 
+  WebEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt WebElasticIP.AllocationId
+      InstanceId: !Ref WebServerInstance
+
+# Once the stack is created, the following data will be displayed as outputs: 
+# Web elastic IP 
+# Web Server private IP 
+# DB server Private IP
+Outputs:
+  WebElasticIP:
+    Description: Elastic IP assigned to the Web EC2 instance
+    Value: !Ref WebElasticIP
+
+  WebServerPrivateIP:
+    Description: Private IP of the Web EC2 instance
+    Value: !GetAtt WebServerInstance.PrivateIp
+
+  DBServerPrivateIP:
+    Description: Private IP of the DB EC2 instance
+    Value: !GetAtt DBServerInstance.PrivateIp
