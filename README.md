@@ -1,5 +1,3 @@
-# aws-automation-test-web-server-db
-
 # AWS IaC – Secure 2-Tier
 
 CloudFormation template that deploys a secure 2-tier LAMP-style architecture:
